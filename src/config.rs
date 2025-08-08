@@ -113,12 +113,14 @@ impl BuildConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct InternalSourceConfig {
+    disable: Option<bool>,
     path: Option<RelativePathBuf>,
     exclude: Option<Vec<RelativePathBuf>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct SourceConfig {
+    pub(crate) disable: bool,
     pub(crate) path: PathBuf,
     pub(crate) exclude: Vec<PathBuf>,
 }
@@ -127,6 +129,7 @@ impl SourceConfig {
     fn init(source: Option<InternalSourceConfig>, default_path: &str) -> Self {
         match source {
             Some(source) => Self {
+                disable: source.disable.unwrap_or(false),
                 path: source
                     .path
                     .map(|rel| rel.into_pathbuf())
@@ -137,6 +140,7 @@ impl SourceConfig {
                     .unwrap_or(vec![]),
             },
             None => Self {
+                disable: false,
                 path: PathBuf::from(default_path),
                 exclude: vec![],
             },
@@ -228,6 +232,10 @@ impl Config {
         writable
             .write_fmt(format_args!("{config_str}"))
             .context("failed to write default toml to writer")
+    }
+
+    pub fn get_name(&self) -> &str {
+        &self.package.name
     }
 }
 

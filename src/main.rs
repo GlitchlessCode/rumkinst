@@ -2,19 +2,25 @@ mod cli;
 
 use std::{
     fs::{self, File},
+    io::{Seek, Write},
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use cli::{Command, Rumkinst};
+use flate2::{Compression, GzBuilder};
+use nanoid::nanoid;
 use rumkinst::{
     config::{Config, find_config_file_at, identifier::Identifier},
     error_log::Log,
+    installer_gen::{RumkinstFiles, find_all_files},
+    progress_log::{progress_wrapper, setup_log_wrapper},
 };
+use sha2::{Digest, Sha256};
 
 fn setup_logging(config: &Rumkinst) {
-    env_logger::Builder::from_env(
+    let logger = env_logger::Builder::from_env(
         env_logger::Env::default()
             .default_filter_or(
                 config
@@ -31,11 +37,14 @@ fn setup_logging(config: &Rumkinst) {
                     .get_name(),
             ),
     )
-    .init();
+    .build();
+    let filter = logger.filter();
+
+    setup_log_wrapper(logger, filter);
 }
 
 fn move_to_config_parent(path: &Path) -> Result<()> {
-    log::trace!("Moving working directory");
+    log::trace!("moving working directory");
     std::env::set_current_dir(path.parent().context("could not find parent directory")?)
         .context("failed to change working directory")?;
     Ok(())
@@ -61,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn command_new(name: Identifier, dir_path: PathBuf) -> Result<()> {
-    log::trace!("Running command logic for `new`");
+    log::trace!("running command logic for `new`");
     log::info!("Creating a new rumkinst directory...");
 
     if dir_path.exists() {
@@ -89,10 +98,9 @@ fn create_dir_with_context(dir_path: PathBuf) -> Result<()> {
 }
 
 fn command_make(path: Option<PathBuf>) -> Result<()> {
-    log::trace!("Running command logic for `make`");
-    let config_path = find_config_file_at(path)
-        .context("could not find `rumkinst.toml` config file")
-        .fatal()?;
+    log::trace!("running command logic for `make`");
+    let config_path =
+        find_config_file_at(path).context("could not find `rumkinst.toml` config file")?;
 
     let config_file =
         File::open(&config_path).with_context(|| format!("failed to open {config_path:?}"))?;
@@ -102,6 +110,67 @@ fn command_make(path: Option<PathBuf>) -> Result<()> {
 
     move_to_config_parent(&config_path)
         .context("could not move to the parent directory of rumkinst.toml")?;
+
+    let run_id = nanoid!();
+    let out_dir = PathBuf::from(format!("./out/{run_id}"));
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create output directory {out_dir:?}"))?;
+
+    log::info!("Reading source directories");
+    let all_files = progress_wrapper(3, || find_all_files(&config))
+        .context("could not find all files for packaging")?;
+
+    log::info!("Making rumkinst artifacts...");
+
+    if all_files.total_files() > 0 {
+        progress_wrapper(all_files.total_files() as u64, || {
+            make_archive(&config, &out_dir, &all_files)
+        })
+        .context("failed to make archive file")?;
+    } else {
+        log::warn!("no source files included, skipping making archive file");
+    }
+
+    log::info!("Finished: artifacts available in output directory \"{run_id}\"");
+
+    Ok(())
+}
+
+fn make_archive(config: &Config, out_dir: &Path, all_files: &RumkinstFiles) -> Result<()> {
+    let archive_name = format!("{}.tar.gz", config.get_name());
+    let checksum_name = format!("{archive_name}.sha256");
+
+    let archive_path = out_dir.join(&archive_name);
+    let checksum_path = out_dir.join(&checksum_name);
+
+    log::info!("Making archive \"{archive_name}\"");
+
+    let archive_file = File::create_new(&archive_path)
+        .with_context(|| format!("failed to create new archive file at {archive_path:?}"))?;
+    let mut checksum_file = File::create_new(&checksum_path)
+        .with_context(|| format!("failed to create new checksum file at {checksum_path:?}"))?;
+    let mut encoder = GzBuilder::new()
+        .filename(archive_name.as_str())
+        .write(archive_file, Compression::best());
+    all_files
+        .write_archive(&mut encoder)
+        .with_context(|| format!("failed to write archive to {archive_path:?}"))?;
+    let mut finished_file = encoder
+        .finish()
+        .context("failed to finish gzip encoding of archive")?;
+
+    finished_file
+        .seek(std::io::SeekFrom::Start(0))
+        .context("failed to seek archive to start for checksum generation")?;
+
+    let mut sha256 = Sha256::new();
+    std::io::copy(&mut finished_file, &mut sha256)
+        .context("failed to copy archive file into hasher")?;
+    let digest = sha256.finalize();
+
+    checksum_file
+        .write_fmt(format_args!("{digest:x}  {archive_name}"))
+        .with_context(|| format!("failed to write checksum to {checksum_path:?}"))?;
 
     Ok(())
 }
